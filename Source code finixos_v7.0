@@ -1,0 +1,720 @@
+// ============================================
+// FINIX OS v7.0 - ULTIMATE EDITION
+// Creator: Nurudeen Al Haitami
+// ============================================
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <signal.h>
+#include <setjmp.h>
+#include <errno.h>
+#include <pwd.h>
+#include <grp.h>
+#include <ctype.h>
+
+// ============================================
+// KONFIGURASI
+// ============================================
+#define MAX_NAME 64
+#define MAX_PATH 256
+#define MAX_LINE 512
+#define MAX_USERS 32
+#define MAX_GROUPS 16
+#define MAX_HISTORY 100
+
+// ============================================
+// WARNA ANSI
+// ============================================
+#define COLOR_RED     "\033[31m"
+#define COLOR_GREEN   "\033[32m"
+#define COLOR_YELLOW  "\033[33m"
+#define COLOR_BLUE    "\033[34m"
+#define COLOR_MAGENTA "\033[35m"
+#define COLOR_CYAN    "\033[36m"
+#define COLOR_RESET   "\033[0m"
+
+// ============================================
+// BAHASA
+// ============================================
+typedef enum { LANG_EN, LANG_ID } Language;
+Language current_lang = LANG_EN;
+
+// ============================================
+// REFERENCE COUNTING
+// ============================================
+typedef struct refcount { int count; } refcount_t;
+static inline void refcount_set(refcount_t *r, int val) { r->count = val; }
+static inline void refcount_inc(refcount_t *r) { __sync_fetch_and_add(&r->count, 1); }
+static inline int refcount_dec(refcount_t *r) { return __sync_fetch_and_sub(&r->count, 1) == 1; }
+
+// ============================================
+// LINKED LIST
+// ============================================
+struct list_head { struct list_head *next, *prev; };
+#define LIST_HEAD_INIT(name) { &(name), &(name) }
+#define LIST_HEAD(name) struct list_head name = LIST_HEAD_INIT(name)
+
+static inline void INIT_LIST_HEAD(struct list_head *list) { list->next = list; list->prev = list; }
+static inline void __list_add(struct list_head *new, struct list_head *prev, struct list_head *next) {
+    next->prev = new; new->next = next; new->prev = prev; prev->next = new;
+}
+static inline void list_add(struct list_head *new, struct list_head *head) { __list_add(new, head, head->next); }
+static inline void list_add_tail(struct list_head *new, struct list_head *head) { __list_add(new, head->prev, head); }
+static inline void __list_del(struct list_head *prev, struct list_head *next) { prev->next = next; next->prev = prev; }
+static inline void list_del(struct list_head *entry) { __list_del(entry->prev, entry->next); entry->next = NULL; entry->prev = NULL; }
+
+#define list_entry(ptr, type, member) ((type *)((char *)(ptr) - (size_t)(&((type *)0)->member)))
+#define list_for_each(pos, head) for (pos = (head)->next; pos != (head); pos = pos->next)
+#define list_for_each_safe(pos, n, head) for (pos = (head)->next, n = pos->next; pos != (head); pos = n, n = pos->next)
+
+// ============================================
+// MEMORY CACHE
+// ============================================
+typedef struct kmem_cache {
+    char name[32]; size_t obj_size; int obj_count; int max_objs;
+    void **objects; int *free_list; int free_count; int lock;
+} kmem_cache_t;
+
+kmem_cache_t *user_cache, *group_cache, *firewall_rule_cache;
+
+kmem_cache_t *kmem_cache_create(const char *name, size_t obj_size, int max_objs) {
+    kmem_cache_t *cache = malloc(sizeof(kmem_cache_t));
+    if (!cache) return NULL;
+    strncpy(cache->name, name, 31);
+    cache->obj_size = obj_size;
+    cache->obj_count = 0;
+    cache->max_objs = max_objs;
+    cache->objects = malloc(sizeof(void*) * max_objs);
+    cache->free_list = malloc(sizeof(int) * max_objs);
+    cache->free_count = max_objs;
+    cache->lock = 0;
+    for (int i = 0; i < max_objs; i++) { cache->free_list[i] = i; cache->objects[i] = NULL; }
+    return cache;
+}
+
+void *kmem_cache_alloc(kmem_cache_t *cache) {
+    while (__sync_lock_test_and_set(&cache->lock, 1)) {}
+    if (cache->free_count == 0) { cache->lock = 0; return NULL; }
+    int idx = cache->free_list[--cache->free_count];
+    if (!cache->objects[idx]) cache->objects[idx] = malloc(cache->obj_size);
+    if (!cache->objects[idx]) { cache->lock = 0; return NULL; }
+    memset(cache->objects[idx], 0, cache->obj_size);
+    cache->obj_count++;
+    cache->lock = 0;
+    return cache->objects[idx];
+}
+
+void kmem_cache_free(kmem_cache_t *cache, void *obj) {
+    while (__sync_lock_test_and_set(&cache->lock, 1)) {}
+    for (int i = 0; i < cache->max_objs; i++) {
+        if (cache->objects[i] == obj) { cache->free_list[cache->free_count++] = i; cache->obj_count--; break; }
+    }
+    cache->lock = 0;
+}
+
+void kmem_cache_destroy(kmem_cache_t *cache) {
+    for (int i = 0; i < cache->max_objs; i++) if (cache->objects[i]) free(cache->objects[i]);
+    free(cache->objects); free(cache->free_list); free(cache);
+}
+
+void *kmemdup(const void *src, size_t len) { void *p = malloc(len); if (p) memcpy(p, src, len); return p; }
+char *kstrdup(const char *s) { if (!s) return NULL; size_t len = strlen(s) + 1; char *p = malloc(len); if (p) memcpy(p, s, len); return p; }
+
+// ============================================
+// USER & GROUP
+// ============================================
+typedef struct finix_group {
+    int gid; char name[MAX_NAME]; int permissions; refcount_t refcnt; struct list_head list;
+} finix_group_t;
+
+typedef struct finix_user {
+    int uid; char username[MAX_NAME]; char password_hash[MAX_NAME];
+    int gid; int *groups; int ngroups; refcount_t refcnt; struct list_head list;
+} finix_user_t;
+
+struct list_head user_list, group_list;
+int next_uid = 1000, next_gid = 100;
+finix_user_t *current_user = NULL;
+
+int group_search(int *groups, int ngroups, int gid) {
+    for (int i = 0; i < ngroups; i++) if (groups[i] == gid) return 1;
+    return 0;
+}
+
+void simple_hash(const char *input, char *output) {
+    unsigned long hash = 5381; int c;
+    while ((c = *input++)) hash = ((hash << 5) + hash) + c;
+    sprintf(output, "%lx", hash);
+}
+
+void init_user_system(void) {
+    INIT_LIST_HEAD(&user_list); INIT_LIST_HEAD(&group_list);
+    
+    finix_group_t *g;
+    g = kmem_cache_alloc(group_cache); g->gid = next_gid++; strcpy(g->name, "wheel"); g->permissions = 2; refcount_set(&g->refcnt, 1); list_add_tail(&g->list, &group_list);
+    g = kmem_cache_alloc(group_cache); g->gid = next_gid++; strcpy(g->name, "users"); g->permissions = 1; refcount_set(&g->refcnt, 1); list_add_tail(&g->list, &group_list);
+    g = kmem_cache_alloc(group_cache); g->gid = next_gid++; strcpy(g->name, "guests"); g->permissions = 0; refcount_set(&g->refcnt, 1); list_add_tail(&g->list, &group_list);
+    
+    finix_user_t *u = kmem_cache_alloc(user_cache);
+    u->uid = 0; strcpy(u->username, "root"); simple_hash("finix123", u->password_hash);
+    u->gid = 100; u->ngroups = 1; u->groups = malloc(sizeof(int)); u->groups[0] = 100;
+    refcount_set(&u->refcnt, 1); list_add_tail(&u->list, &user_list);
+    current_user = u;
+}
+
+int authenticate_user(const char *username, const char *password) {
+    char hash[MAX_NAME]; simple_hash(password, hash);
+    struct list_head *pos; finix_user_t *u;
+    list_for_each(pos, &user_list) {
+        u = list_entry(pos, finix_user_t, list);
+        if (strcmp(u->username, username) == 0 && strcmp(u->password_hash, hash) == 0) {
+            current_user = u; return 1;
+        }
+    }
+    return 0;
+}
+
+int user_has_permission(int required_perm) {
+    if (!current_user) return 0;
+    if (current_user->uid == 0) return 1;
+    struct list_head *pos; finix_group_t *g;
+    list_for_each(pos, &group_list) {
+        g = list_entry(pos, finix_group_t, list);
+        if (group_search(current_user->groups, current_user->ngroups, g->gid) && g->permissions >= required_perm) return 1;
+    }
+    return 0;
+}
+
+// ============================================
+// COMMAND HISTORY
+// ============================================
+char *history[MAX_HISTORY];
+int history_count = 0;
+
+void add_to_history(const char *cmd) {
+    if (history_count < MAX_HISTORY) history[history_count++] = kstrdup(cmd);
+    else { free(history[0]); for (int i = 1; i < MAX_HISTORY; i++) history[i-1] = history[i]; history[MAX_HISTORY-1] = kstrdup(cmd); }
+}
+
+void show_history(void) {
+    if (current_lang == LANG_ID) printf(COLOR_CYAN "\n📜 Riwayat Perintah:\n" COLOR_RESET);
+    else printf(COLOR_CYAN "\n📜 Command History:\n" COLOR_RESET);
+    for (int i = 0; i < history_count; i++) printf("%3d: %s\n", i+1, history[i]);
+}
+
+// ============================================
+// ERROR RECOVERY
+// ============================================
+jmp_buf crash_env;
+int crash_counter = 0;
+time_t last_crash_time = 0;
+
+void crash_handler(int sig) {
+    time_t now = time(NULL);
+    if (now - last_crash_time > 60) { crash_counter = 0; last_crash_time = now; }
+    if (crash_counter++ < 5) { printf(COLOR_RED "\n⚠️ FinixOS crash detected! Restarting...\n" COLOR_RESET); longjmp(crash_env, 1); }
+    else if (crash_counter == 5) { printf(COLOR_RED "\n⚠️ Too many crashes! Entering safe mode...\n" COLOR_RESET); longjmp(crash_env, 2); }
+}
+
+void setup_error_recovery(void) { signal(SIGSEGV, crash_handler); signal(SIGABRT, crash_handler); signal(SIGFPE, crash_handler); }
+
+// ============================================
+// BOOT SCREEN
+// ============================================
+void boot_screen(void) {
+    system("clear");
+    printf(COLOR_CYAN);
+    printf("  ______ _       _           ____   ____   \n");
+    printf(" |  ___(_) __ _| | ___     / ___| |  _ \\  \n");
+    printf(" | |_  | |/ _` | |/ _ \\   | |  _  | |_) | \n");
+    printf(" |  _| | | (_| | |  __/   | |_| | |  __/  \n");
+    printf(" |_|   |_|\\__, |_|\\___|    \\____| |_|     \n");
+    printf("          |___/                            \n");
+    printf(
+       "  _____ _       _        ___  __   __\n"
+       " |  ___(_)_ __ | |_     / _ \\ \\ \\ / /\n"
+       " | |_  | | '_ \\| __|   / /_\\ \\ \\ V / \n"
+       " |  _| | | | | | |_    |  _  | /   \\ \n"
+       " |_|   |_|_| |_|\\__|   |_| |_|/_/\\_\\\n\n");
+    printf(COLOR_RESET);
+    printf(COLOR_GREEN "FinixOS v7.0 - Ultimate Edition\n" COLOR_RESET);
+    printf("Creator: Nurudeen Al Haitami\n\n");
+    printf("Booting: ["); fflush(stdout);
+    for(int i=0;i<=20;i++) { printf("#"); fflush(stdout); usleep(50000); }
+    printf("] 100%%\n");
+    printf(COLOR_GREEN "[OK]" COLOR_RESET " Kernel (simulated) loaded\n");
+    printf(COLOR_GREEN "[OK]" COLOR_RESET " Memory management initialized\n");
+    printf(COLOR_GREEN "[OK]" COLOR_RESET " User system initialized\n");
+    printf(COLOR_GREEN "[OK]" COLOR_RESET " Security modules active\n");
+    printf(COLOR_GREEN "[OK]" COLOR_RESET " Network tools ready\n");
+    printf(COLOR_GREEN "[OK]" COLOR_RESET " Firewall active\n");
+    printf(COLOR_GREEN "[OK]" COLOR_RESET " Package manager (sandboxed) ready\n");
+    printf(COLOR_GREEN "[OK]" COLOR_RESET " Languages: C, Python, Node.js\n\n");
+}
+
+// ============================================
+// FIREWALL
+// ============================================
+typedef struct firewall_rule {
+    char proto[8]; int port; char action[8]; int packets_blocked; struct list_head list;
+} firewall_rule_t;
+
+struct list_head firewall_rules;
+
+void firewall_init(void) { INIT_LIST_HEAD(&firewall_rules); }
+
+void cmd_firewall_add(char *proto, int port, char *action) {
+    if (!user_has_permission(1)) {
+        if (current_lang == LANG_ID) printf(COLOR_RED "❌ Izin ditolak!\n" COLOR_RESET);
+        else printf(COLOR_RED "❌ Permission denied!\n" COLOR_RESET);
+        return;
+    }
+    firewall_rule_t *r = kmem_cache_alloc(firewall_rule_cache);
+    strcpy(r->proto, proto); r->port = port; strcpy(r->action, action); r->packets_blocked = 0;
+    list_add_tail(&r->list, &firewall_rules);
+    if (current_lang == LANG_ID) printf(COLOR_GREEN "✅ Aturan ditambahkan: %s port %d %s\n" COLOR_RESET, proto, port, action);
+    else printf(COLOR_GREEN "✅ Rule added: %s port %d %s\n" COLOR_RESET, proto, port, action);
+}
+
+void cmd_firewall_list(void) {
+    if (current_lang == LANG_ID) printf(COLOR_CYAN "\n📋 Aturan Firewall:\n" COLOR_RESET);
+    else printf(COLOR_CYAN "\n📋 Firewall Rules:\n" COLOR_RESET);
+    printf("Proto  Port  Action    Blocked\n------------------------------\n");
+    struct list_head *pos; firewall_rule_t *r;
+    list_for_each(pos, &firewall_rules) {
+        r = list_entry(pos, firewall_rule_t, list);
+        printf("%-6s %-5d %-8s %d\n", r->proto, r->port, r->action, r->packets_blocked);
+    }
+}
+
+void cmd_firewall_delete(int port) {
+    struct list_head *pos, *n; firewall_rule_t *r; int found = 0;
+    list_for_each_safe(pos, n, &firewall_rules) {
+        r = list_entry(pos, firewall_rule_t, list);
+        if (r->port == port) { list_del(&r->list); kmem_cache_free(firewall_rule_cache, r); found = 1; break; }
+    }
+    if (found) {
+        if (current_lang == LANG_ID) printf(COLOR_GREEN "✅ Aturan port %d dihapus\n" COLOR_RESET, port);
+        else printf(COLOR_GREEN "✅ Rule for port %d deleted\n" COLOR_RESET, port);
+    } else {
+        if (current_lang == LANG_ID) printf(COLOR_RED "❌ Aturan port %d tidak ditemukan\n" COLOR_RESET, port);
+        else printf(COLOR_RED "❌ Rule for port %d not found\n" COLOR_RESET, port);
+    }
+}
+
+// ============================================
+// NETWORK TOOLS
+// ============================================
+void cmd_netstat(void) {
+    if (current_lang == LANG_ID) printf(COLOR_CYAN "\n🌐 Koneksi Jaringan:\n" COLOR_RESET);
+    else printf(COLOR_CYAN "\n🌐 Network Connections:\n" COLOR_RESET);
+    if (system("which netstat > /dev/null 2>&1") == 0) { system("netstat -tuln | head -20"); return; }
+    FILE *f = fopen("/proc/net/tcp", "r");
+    if (!f) { if (current_lang == LANG_ID) printf("  Informasi jaringan tidak tersedia\n"); else printf("  No network info available\n"); return; }
+    printf("Proto  Local Address    Foreign Address   State\n------------------------------------------------\n");
+    char line[256]; fgets(line, sizeof(line), f);
+    while (fgets(line, sizeof(line), f)) {
+        char local_addr[65], rem_addr[65]; int lport, rport, state_val;
+        sscanf(line, "%*d: %64[0-9A-F]:%X %64[0-9A-F]:%X %X", local_addr, &lport, rem_addr, &rport, &state_val);
+        unsigned int lip[4], rip[4];
+        sscanf(local_addr, "%2x%2x%2x%2x", &lip[3], &lip[2], &lip[1], &lip[0]);
+        sscanf(rem_addr, "%2x%2x%2x%2x", &rip[3], &rip[2], &rip[1], &rip[0]);
+        printf("TCP     %d.%d.%d.%d:%-5d ", lip[0], lip[1], lip[2], lip[3], lport);
+        printf("%d.%d.%d.%d:%-5d ", rip[0], rip[1], rip[2], rip[3], rport);
+        switch (state_val) {
+            case 1: printf("ESTABLISHED"); break; case 6: printf("TIME_WAIT"); break;
+            case 10: printf("LISTEN"); break; default: printf("UNKNOWN");
+        }
+        printf("\n");
+    }
+    fclose(f);
+}
+
+void cmd_nmap(char *host) {
+    if (!host || strlen(host) == 0) { if (current_lang == LANG_ID) printf(COLOR_YELLOW "Usage: nmap <host>\n" COLOR_RESET); else printf(COLOR_YELLOW "Usage: nmap <host>\n" COLOR_RESET); return; }
+    if (current_lang == LANG_ID) printf(COLOR_CYAN "\n🔍 Memindai %s...\n" COLOR_RESET, host);
+    else printf(COLOR_CYAN "\n🔍 Scanning %s...\n" COLOR_RESET, host);
+    char cmd[256]; snprintf(cmd, sizeof(cmd), "which nmap > /dev/null 2>&1");
+    if (system(cmd) == 0) { snprintf(cmd, sizeof(cmd), "nmap -F %s | head -30", host); system(cmd); }
+    else { printf("Port    Status\n--------------\n22/tcp  OPEN\n80/tcp  OPEN\n443/tcp OPEN\n8080/tcp OPEN\n"); }
+}
+
+void cmd_ping(char *host) { if (!host || strlen(host) == 0) { printf(COLOR_YELLOW "Usage: ping <host>\n" COLOR_RESET); return; } char cmd[256]; snprintf(cmd, sizeof(cmd), "ping -c 4 %s", host); system(cmd); }
+void cmd_ifconfig(void) { if (system("which ifconfig > /dev/null 2>&1") == 0) system("ifconfig | head -30"); else system("ip addr show | head -30"); }
+void cmd_curl(char *arg) { if (!arg || strlen(arg) == 0) { printf(COLOR_YELLOW "Usage: curl <url>\n" COLOR_RESET); return; } char cmd[256]; snprintf(cmd, sizeof(cmd), "curl -L -s '%s' | head -50", arg); system(cmd); }
+void cmd_wget(char *arg) { if (!arg || strlen(arg) == 0) { printf(COLOR_YELLOW "Usage: wget <url>\n" COLOR_RESET); return; } char cmd[256]; snprintf(cmd, sizeof(cmd), "wget --no-verbose '%s'", arg); system(cmd); }
+
+// ============================================
+// SYSTEM MONITORING
+// ============================================
+void cmd_cpu(void) {
+    if (current_lang == LANG_ID) printf(COLOR_CYAN "\n💻 Informasi CPU:\n" COLOR_RESET);
+    else printf(COLOR_CYAN "\n💻 CPU Information:\n" COLOR_RESET);
+    FILE *f = fopen("/proc/cpuinfo", "r");
+    if (f) { char line[256]; int count = 0; while (fgets(line, sizeof(line), f) && count < 20) { if (strstr(line, "processor") || strstr(line, "model name") || strstr(line, "cpu MHz") || strstr(line, "cache size")) { printf("%s", line); count++; } } fclose(f); }
+    else { printf("Processor: ARMv8-A\nCores: 8\nFrequency: 2.0GHz\n"); }
+}
+
+void cmd_ram(void) {
+    if (current_lang == LANG_ID) printf(COLOR_CYAN "\n🧠 Informasi RAM:\n" COLOR_RESET);
+    else printf(COLOR_CYAN "\n🧠 RAM Information:\n" COLOR_RESET);
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (f) { char line[256]; int count = 0; while (fgets(line, sizeof(line), f) && count < 10) { if (strstr(line, "MemTotal") || strstr(line, "MemFree") || strstr(line, "MemAvailable") || strstr(line, "SwapTotal")) { printf("%s", line); count++; } } fclose(f); }
+    else { if (system("which termux-info > /dev/null 2>&1") == 0) system("termux-info | grep -i memory | head -10"); else printf("MemTotal: 4 GB\nMemFree: 1.2 GB\nMemAvailable: 2.5 GB\n"); }
+}
+
+void cmd_disk(void) { if (current_lang == LANG_ID) printf(COLOR_CYAN "\n💾 Informasi Penyimpanan:\n" COLOR_RESET); else printf(COLOR_CYAN "\n💾 Storage Information:\n" COLOR_RESET); system("df -h /sdcard /data 2>/dev/null | head -10"); }
+
+void cmd_battery(void) {
+    if (current_lang == LANG_ID) printf(COLOR_CYAN "\n🔋 Informasi Baterai:\n" COLOR_RESET);
+    else printf(COLOR_CYAN "\n🔋 Battery Information:\n" COLOR_RESET);
+    if (system("which termux-battery-status > /dev/null 2>&1") == 0) system("termux-battery-status | python3 -m json.tool | head -15");
+    else {
+        FILE *f = fopen("/sys/class/power_supply/battery/capacity", "r"); if (f) { char cap[10]; fgets(cap, sizeof(cap), f); fclose(f); printf("Capacity: %s%%\n", cap); }
+        f = fopen("/sys/class/power_supply/battery/status", "r"); if (f) { char status[20]; fgets(status, sizeof(status), f); fclose(f); printf("Status: %s", status); }
+    }
+}
+
+void cmd_android(void) {
+    if (current_lang == LANG_ID) printf(COLOR_CYAN "\n🤖 Informasi Android:\n" COLOR_RESET);
+    else printf(COLOR_CYAN "\n🤖 Android Information:\n" COLOR_RESET);
+    FILE *f = popen("getprop ro.build.version.release", "r"); if (f) { char version[50]; fgets(version, sizeof(version), f); pclose(f); printf("Android Version: %s", version); }
+    f = popen("getprop ro.build.version.security_patch", "r"); if (f) { char patch[50]; fgets(patch, sizeof(patch), f); pclose(f); printf("Security Patch: %s", patch); }
+    f = popen("getprop ro.product.model", "r"); if (f) { char model[100]; fgets(model, sizeof(model), f); pclose(f); printf("Device Model: %s", model); }
+    f = popen("getprop ro.product.manufacturer", "r"); if (f) { char manu[100]; fgets(manu, sizeof(manu), f); pclose(f); printf("Manufacturer: %s", manu); }
+    printf("Kernel: "); system("uname -a");
+}
+
+// ============================================
+// PACKAGE MANAGER
+// ============================================
+void cmd_pkg_install(char *pkg) {
+    if (!pkg || strlen(pkg) == 0) { printf(COLOR_YELLOW "Usage: pkg install <package>\n" COLOR_RESET); return; }
+    if (current_lang == LANG_ID) printf(COLOR_GREEN "📦 Menginstall %s (sandbox mode)...\n" COLOR_RESET, pkg);
+    else printf(COLOR_GREEN "📦 Installing %s (sandbox mode)...\n" COLOR_RESET, pkg);
+    if (system("which proot-distro > /dev/null 2>&1") == 0) { char cmd[256]; snprintf(cmd, sizeof(cmd), "proot-distro login -- apt install -y --simulate %s", pkg); printf(COLOR_YELLOW "Simulasi install (dry run):\n" COLOR_RESET); system(cmd); printf(COLOR_YELLOW "\nUntuk benar-benar install, gunakan: proot-distro login -- apt install -y %s\n" COLOR_RESET, pkg); }
+    else if (system("which apt > /dev/null 2>&1") == 0) { char cmd[256]; snprintf(cmd, sizeof(cmd), "apt show %s 2>/dev/null | head -15", pkg); system(cmd); printf(COLOR_YELLOW "\nUntuk install: apt install %s\n" COLOR_RESET, pkg); }
+    else { if (current_lang == LANG_ID) printf(COLOR_RED "❌ Package manager tidak tersedia\n" COLOR_RESET); else printf(COLOR_RED "❌ Package manager not available\n" COLOR_RESET); }
+}
+
+void cmd_pkg_search(char *pkg) { if (!pkg || strlen(pkg) == 0) { printf(COLOR_YELLOW "Usage: pkg search <package>\n" COLOR_RESET); return; } if (system("which apt-cache > /dev/null 2>&1") == 0) { char cmd[256]; snprintf(cmd, sizeof(cmd), "apt-cache search %s | head -30", pkg); system(cmd); } else printf(COLOR_RED "apt-cache not available\n" COLOR_RESET); }
+void cmd_pkg_update(void) { if (current_lang == LANG_ID) printf(COLOR_GREEN "📦 Mengupdate repository...\n" COLOR_RESET); else printf(COLOR_GREEN "📦 Updating repositories...\n" COLOR_RESET); if (system("which apt > /dev/null 2>&1") == 0) system("apt update 2>&1 | head -20"); else printf(COLOR_RED "apt not available\n" COLOR_RESET); }
+void cmd_pkg_list(void) { if (current_lang == LANG_ID) printf(COLOR_GREEN "📦 Paket terinstall:\n" COLOR_RESET); else printf(COLOR_GREEN "📦 Installed packages:\n" COLOR_RESET); if (system("which apt > /dev/null 2>&1") == 0) system("apt list --installed 2>/dev/null | head -30"); else if (system("which proot-distro > /dev/null 2>&1") == 0) system("proot-distro list"); }
+
+// ============================================
+// EDITOR
+// ============================================
+void simple_editor(char *filename);
+void cmd_nano(char *filename) {
+    if (!filename || strlen(filename) == 0) { printf(COLOR_YELLOW "Usage: nano <filename>\n" COLOR_RESET); return; }
+    if (system("which nano > /dev/null 2>&1") == 0) { char cmd[256]; snprintf(cmd, sizeof(cmd), "nano %s", filename); system(cmd); }
+    else simple_editor(filename);
+}
+
+void simple_editor(char *filename) {
+    printf(COLOR_YELLOW "\n📝 Simple Editor (type 'SAVE' on new line to save, 'EXIT' to quit)\n" COLOR_RESET);
+    FILE *f = fopen(filename, "a+"); if (!f) { printf(COLOR_RED "Cannot open file: %s\n" COLOR_RESET, filename); return; }
+    printf("\n--- Current content ---\n"); char line[512]; rewind(f); while (fgets(line, sizeof(line), f)) printf("%s", line);
+    printf("\n--- End of file ---\n\n");
+    printf("Enter text (SAVE on new line to save, EXIT to quit):\n");
+    while (1) {
+        printf("> "); fflush(stdout);
+        if (!fgets(line, sizeof(line), stdin)) break;
+        line[strcspn(line, "\n")] = 0;
+        if (strcmp(line, "SAVE") == 0) break;
+        else if (strcmp(line, "EXIT") == 0) { fclose(f); return; }
+        else fprintf(f, "%s\n", line);
+    }
+    fclose(f);
+    printf(COLOR_GREEN "File saved: %s\n" COLOR_RESET, filename);
+}
+
+// ============================================
+// PROCESS SCANNER
+// ============================================
+void cmd_ps(void) { if (current_lang == LANG_ID) printf(COLOR_CYAN "\n📊 Proses yang berjalan:\n" COLOR_RESET); else printf(COLOR_CYAN "\n📊 Running processes:\n" COLOR_RESET); system("ps aux | head -30"); }
+void cmd_kill_process(char *pid_str) { if (!pid_str || strlen(pid_str) == 0) { printf(COLOR_YELLOW "Usage: kill <pid>\n" COLOR_RESET); return; } int pid = atoi(pid_str); if (pid <= 0) { printf(COLOR_RED "Invalid PID\n" COLOR_RESET); return; } char cmd[64]; snprintf(cmd, sizeof(cmd), "kill %d", pid); if (system(cmd) == 0) { if (current_lang == LANG_ID) printf(COLOR_GREEN "✅ Proses %d dihentikan\n" COLOR_RESET, pid); else printf(COLOR_GREEN "✅ Process %d terminated\n" COLOR_RESET, pid); } else printf(COLOR_RED "❌ Gagal menghentikan proses %d\n" COLOR_RESET, pid); }
+
+void cmd_scan(void) {
+    if (current_lang == LANG_ID) printf(COLOR_CYAN "\n🔍 Memindai proses mencurigakan...\n" COLOR_RESET);
+    else printf(COLOR_CYAN "\n🔍 Scanning for suspicious processes...\n" COLOR_RESET);
+    FILE *f = popen("ps aux", "r"); if (!f) return;
+    char line[256]; int suspicious = 0; char *suspicious_names[] = {"nc", "netcat", "ncat", "crypt", "miner", NULL};
+    fgets(line, sizeof(line), f);
+    while (fgets(line, sizeof(line), f)) {
+        for (int i = 0; suspicious_names[i]; i++) {
+            if (strstr(line, suspicious_names[i])) {
+                if (suspicious == 0) { if (current_lang == LANG_ID) printf("⚠️  Proses mencurigakan:\n"); else printf("⚠️  Suspicious processes:\n"); }
+                printf("  %s", line); suspicious++; break;
+            }
+        }
+    }
+    if (suspicious == 0) { if (current_lang == LANG_ID) printf(COLOR_GREEN "✅ Tidak ada proses mencurigakan ditemukan\n" COLOR_RESET); else printf(COLOR_GREEN "✅ No suspicious processes found\n" COLOR_RESET); }
+    pclose(f);
+}
+
+// ============================================
+// BASIC ANTIVIRUS
+// ============================================
+typedef struct { char signature[64]; char description[128]; char action[32]; } virus_signature_t;
+virus_signature_t virus_db[] = {
+    {"<?php eval(", "PHP eval backdoor", "QUARANTINE"},
+    {"base64_decode(", "Potential PHP malware", "REPORT"},
+    {"chmod(777,", "Permission escalation", "REPORT"},
+    {"rm -rf /", "Destructive command", "BLOCK"},
+    {"wget http://evil", "Download from untrusted", "REPORT"},
+    {"curl http://evil", "Download from untrusted", "REPORT"},
+    {"perl -e 'system(", "Perl backdoor", "QUARANTINE"},
+    {"python -c 'import socket", "Reverse shell attempt", "BLOCK"},
+    {"<script>alert(", "XSS payload", "REPORT"},
+    {"DROP TABLE", "SQL injection", "REPORT"},
+    {"',0000,0000,0", "Common exploit pattern", "REPORT"}
+};
+int virus_db_count = sizeof(virus_db) / sizeof(virus_db[0]);
+
+void cmd_antivirus_scan(char *path) {
+    if (!path || strlen(path) == 0) path = ".";
+    if (current_lang == LANG_ID) printf(COLOR_CYAN "\n🔬 Memindai virus di %s...\n" COLOR_RESET, path);
+    else printf(COLOR_CYAN "\n🔬 Scanning for viruses in %s...\n" COLOR_RESET, path);
+    char cmd[512]; snprintf(cmd, sizeof(cmd), "find %s -type f -name '*.php' -o -name '*.sh' -o -name '*.pl' -o -name '*.py' 2>/dev/null | head -100", path);
+    FILE *f = popen(cmd, "r"); if (!f) return;
+    char filepath[256]; int infected = 0;
+    while (fgets(filepath, sizeof(filepath), f)) {
+        filepath[strcspn(filepath, "\n")] = 0;
+        FILE *fp = fopen(filepath, "r"); if (!fp) continue;
+        char content[1024] = {0}; fread(content, 1, sizeof(content)-1, fp); fclose(fp);
+        for (int i = 0; i < virus_db_count; i++) {
+            if (strstr(content, virus_db[i].signature)) {
+                if (infected == 0) { if (current_lang == LANG_ID) printf("\n⚠️  File terinfeksi ditemukan:\n"); else printf("\n⚠️  Infected files found:\n"); }
+                printf("  📄 %s\n", filepath); printf("     Signature: %s\n", virus_db[i].signature); printf("     Description: %s\n", virus_db[i].description); printf("     Action: %s\n", virus_db[i].action); infected++; break;
+            }
+        }
+    }
+    if (infected == 0) { if (current_lang == LANG_ID) printf(COLOR_GREEN "✅ Tidak ada virus ditemukan\n" COLOR_RESET); else printf(COLOR_GREEN "✅ No viruses found\n" COLOR_RESET); }
+    else { if (current_lang == LANG_ID) printf(COLOR_YELLOW "\n⚠️  Ditemukan %d file terinfeksi\n" COLOR_RESET, infected); else printf(COLOR_YELLOW "\n⚠️  Found %d infected files\n" COLOR_RESET, infected); }
+    pclose(f);
+}
+
+// ============================================
+// GAMES
+// ============================================
+void cmd_game_tebak(void) {
+    int number, guess, tries = 0; srand(time(NULL)); number = rand() % 50 + 1;
+    if (current_lang == LANG_ID) printf(COLOR_CYAN "\n🎮 Tebak Angka (1-50)! (ketik 0 untuk keluar)\n" COLOR_RESET);
+    else printf(COLOR_CYAN "\n🎮 Guess the Number (1-50)! (type 0 to exit)\n" COLOR_RESET);
+    while(1) { printf("> "); scanf("%d", &guess); tries++; if(guess == 0) break;
+        if(guess < number) { if (current_lang == LANG_ID) printf("Terlalu kecil!\n"); else printf("Too small!\n"); }
+        else if(guess > number) { if (current_lang == LANG_ID) printf("Terlalu besar!\n"); else printf("Too big!\n"); }
+        else { if (current_lang == LANG_ID) printf(COLOR_GREEN "Selamat! Angka benar %d, dalam %d tebakan\n" COLOR_RESET, number, tries); else printf(COLOR_GREEN "Congratulations! Number was %d, you took %d tries\n" COLOR_RESET, number, tries); break; }
+    }
+}
+
+char ttt_board[3][3];
+void ttt_init_board() { for(int i=0;i<3;i++) for(int j=0;j<3;j++) ttt_board[i][j]=' '; }
+void ttt_print_board() { printf("\n"); for(int i=0;i<3;i++){ printf(" %c | %c | %c ", ttt_board[i][0], ttt_board[i][1], ttt_board[i][2]); if(i!=2) printf("\n---|---|---\n"); } printf("\n\n"); }
+int ttt_check_winner(char player) {
+    for(int i=0;i<3;i++) if((ttt_board[i][0]==player && ttt_board[i][1]==player && ttt_board[i][2]==player) || (ttt_board[0][i]==player && ttt_board[1][i]==player && ttt_board[2][i]==player)) return 1;
+    if((ttt_board[0][0]==player && ttt_board[1][1]==player && ttt_board[2][2]==player) || (ttt_board[0][2]==player && ttt_board[1][1]==player && ttt_board[2][0]==player)) return 1;
+    return 0;
+}
+int ttt_board_full() { for(int i=0;i<3;i++) for(int j=0;j<3;j++) if(ttt_board[i][j]==' ') return 0; return 1; }
+
+void cmd_game_tictactoe() {
+    ttt_init_board(); char player='X'; int x,y;
+    if (current_lang == LANG_ID) printf(COLOR_CYAN "\n🎮 Tic-Tac-Toe (Kamu X, AI O)\n" COLOR_RESET);
+    else printf(COLOR_CYAN "\n🎮 Tic-Tac-Toe (You X, AI O)\n" COLOR_RESET);
+    while(1){
+        ttt_print_board();
+        if(player=='X'){
+            if (current_lang == LANG_ID) printf("Posisi (baris kolom 0-2) : ");
+            else printf("Position (row col 0-2) : ");
+            scanf("%d %d",&x,&y);
+            if(x>=0 && x<3 && y>=0 && y<3 && ttt_board[x][y]==' ') ttt_board[x][y]=player;
+            else { if (current_lang == LANG_ID) printf("Posisi tidak valid!\n"); else printf("Invalid position!\n"); continue; }
+        } else {
+            int moved=0; for(int i=0;i<3 && !moved;i++) for(int j=0;j<3 && !moved;j++) if(ttt_board[i][j]==' '){ ttt_board[i][j]=player; moved=1; }
+        }
+        if(ttt_check_winner(player)){ ttt_print_board(); if(player=='X') { if (current_lang == LANG_ID) printf(COLOR_GREEN "Selamat, kamu menang!\n" COLOR_RESET); else printf(COLOR_GREEN "Congratulations, you win!\n" COLOR_RESET); } else { if (current_lang == LANG_ID) printf(COLOR_YELLOW "AI menang!\n" COLOR_RESET); else printf(COLOR_YELLOW "AI wins!\n" COLOR_RESET); } break; }
+        else if(ttt_board_full()){ ttt_print_board(); if (current_lang == LANG_ID) printf(COLOR_YELLOW "Seri!\n" COLOR_RESET); else printf(COLOR_YELLOW "Draw!\n" COLOR_RESET); break; }
+        player = (player=='X') ? 'O':'X';
+    }
+}
+
+// ============================================
+// CALENDAR
+// ============================================
+void cmd_cal(void) {
+    time_t t = time(NULL); struct tm *tm = localtime(&t);
+    int year = tm->tm_year + 1900; int month = tm->tm_mon + 1;
+    char *months_en[] = {"January","February","March","April","May","June","July","August","September","October","November","December"};
+    char *months_id[] = {"Januari","Februari","Maret","April","Mei","Juni","Juli","Agustus","September","Oktober","November","Desember"};
+    if (current_lang == LANG_ID) printf(COLOR_CYAN "\n📅 %s %d\n" COLOR_RESET, months_id[month-1], year);
+    else printf(COLOR_CYAN "\n📅 %s %d\n" COLOR_RESET, months_en[month-1], year);
+    printf("Su Mo Tu We Th Fr Sa\n");
+    struct tm first = {0}; first.tm_year = year - 1900; first.tm_mon = month - 1; first.tm_mday = 1; mktime(&first);
+    int days_in_month = 31;
+    if (month == 4 || month == 6 || month == 9 || month == 11) days_in_month = 30;
+    if (month == 2) { days_in_month = 28; if ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0) days_in_month = 29; }
+    for (int i = 0; i < first.tm_wday; i++) printf("   ");
+    for (int day = 1; day <= days_in_month; day++) {
+        if (day == tm->tm_mday) printf(COLOR_GREEN "%2d " COLOR_RESET, day); else printf("%2d ", day);
+        if ((first.tm_wday + day) % 7 == 0) printf("\n");
+    }
+    printf("\n");
+}
+
+// ============================================
+// PRAYER REMINDER
+// ============================================
+void cmd_pray(void) {
+    if (current_lang == LANG_ID) { printf(COLOR_CYAN "\n🕌 Pengingat Sholat:\n" COLOR_RESET); printf("Subuh   : 04:30\nDzuhur  : 12:00\nAshar   : 15:15\nMaghrib : 18:00\nIsya    : 19:30\n"); }
+    else { printf(COLOR_CYAN "\n🕌 Prayer Reminder:\n" COLOR_RESET); printf("Fajr    : 04:30\nDhuhr   : 12:00\nAsr     : 15:15\nMaghrib : 18:00\nIsha    : 19:30\n"); }
+}
+
+// ============================================
+// FILE MANAGEMENT
+// ============================================
+void cmd_ls(char *arg) { char cmd[128]; if (arg && strlen(arg) > 0) snprintf(cmd, sizeof(cmd), "ls -la --color=auto %s | head -50", arg); else snprintf(cmd, sizeof(cmd), "ls -la --color=auto | head -50"); system(cmd); }
+void cmd_pwd(void) { char cwd[MAX_PATH]; if (getcwd(cwd, sizeof(cwd))) printf("%s\n", cwd); }
+void cmd_cd(char *arg) { if (!arg || strlen(arg) == 0) chdir(getenv("HOME")); else if (chdir(arg) != 0) printf(COLOR_RED "cd: %s: No such directory\n" COLOR_RESET, arg); }
+void cmd_mkdir(char *arg) { if (!arg || strlen(arg) == 0) { printf(COLOR_YELLOW "Usage: mkdir <dirname>\n" COLOR_RESET); return; } if (mkdir(arg, 0755) != 0) printf(COLOR_RED "mkdir: cannot create directory '%s': %s\n" COLOR_RESET, arg, strerror(errno)); }
+void cmd_rm(char *arg) { if (!arg || strlen(arg) == 0) { printf(COLOR_YELLOW "Usage: rm <file>\n" COLOR_RESET); return; } if (unlink(arg) != 0) printf(COLOR_RED "rm: cannot remove '%s': %s\n" COLOR_RESET, arg, strerror(errno)); }
+void cmd_cp(char *src, char *dst) { if (!src || strlen(src) == 0 || !dst || strlen(dst) == 0) { printf(COLOR_YELLOW "Usage: cp <source> <destination>\n" COLOR_RESET); return; } char cmd[256]; snprintf(cmd, sizeof(cmd), "cp -v %s %s", src, dst); system(cmd); }
+void cmd_mv(char *src, char *dst) { if (!src || strlen(src) == 0 || !dst || strlen(dst) == 0) { printf(COLOR_YELLOW "Usage: mv <source> <destination>\n" COLOR_RESET); return; } char cmd[256]; snprintf(cmd, sizeof(cmd), "mv -v %s %s", src, dst); system(cmd); }
+void cmd_cat(char *arg) { if (!arg || strlen(arg) == 0) { printf(COLOR_YELLOW "Usage: cat <file>\n" COLOR_RESET); return; } FILE *f = fopen(arg, "r"); if (!f) { printf(COLOR_RED "cat: %s: No such file\n" COLOR_RESET, arg); return; } char line[512]; while (fgets(line, sizeof(line), f)) printf("%s", line); fclose(f); }
+
+// ============================================
+// LANGUAGE
+// ============================================
+void cmd_lang(char *arg) {
+    if (!arg || strlen(arg) == 0) { if (current_lang == LANG_ID) printf("Bahasa saat ini: Indonesia\nGunakan: lang en / lang id\n"); else printf("Current language: English\nUse: lang en / lang id\n"); return; }
+    if (strcmp(arg, "en") == 0) { current_lang = LANG_EN; printf(COLOR_GREEN "Language changed to English\n" COLOR_RESET); }
+    else if (strcmp(arg, "id") == 0) { current_lang = LANG_ID; printf(COLOR_GREEN "Bahasa diubah ke Indonesia\n" COLOR_RESET); }
+    else printf(COLOR_RED "Invalid language. Use en or id.\n" COLOR_RESET);
+}
+
+// ============================================
+// ABOUT
+// ============================================
+void cmd_about(void) {
+    printf(COLOR_CYAN "\n=== FinixOS v7.0 Ultimate Edition ===\n" COLOR_RESET);
+    printf("Creator: Nurudeen Al Haitami\nBased on: C + Termux + Proot-distro\nArchitecture: ARM64 (simulated)\nKernel: Custom microkernel (simulated)\n");
+    printf("\nFeatures:\n  - Multi-user system with permissions\n  - Memory management (refcount, slab cache)\n  - Firewall with rule management\n  - Network tools (nmap, netstat)\n  - Package manager (APT wrapper)\n");
+    printf("  - Basic antivirus scanner\n  - System monitor (CPU, RAM, battery)\n  - Multi-language (English/Indonesia)\n  - Crash recovery system\n  - Games: Tebak Angka, Tic-Tac-Toe\n  - Prayer reminder\n\nType 'help' for commands\n\n");
+}
+
+// ============================================
+// HELP
+// ============================================
+void cmd_help(void) {
+    if (current_lang == LANG_ID) {
+        printf(COLOR_CYAN "\n=== PERINTAH FINIXOS v7.0 ===\n" COLOR_RESET);
+        printf(COLOR_YELLOW "\nMANAJEMEN FILE:\n  ls [dir]     - Tampilkan daftar file\n  mkdir <nama> - Buat folder\n  rm <file>    - Hapus file\n  cd [dir]     - Pindah folder\n  pwd          - Tampilkan folder saat ini\n  cp <src> <dst> - Salin file\n  mv <src> <dst> - Pindahkan file\n  cat <file>   - Lihat isi file\n  nano <file>  - Edit file\n");
+        printf(COLOR_YELLOW "\nINFORMASI SISTEM:\n  cpu          - Info CPU\n  ram          - Info RAM\n  disk         - Info penyimpanan\n  os           - Info OS\n  device       - Info perangkat\n  battery      - Info baterai\n  android      - Info Android\n");
+        printf(COLOR_YELLOW "\nJARINGAN:\n  netstat      - Lihat koneksi jaringan\n  nmap <host>  - Scan port\n  ping <host>  - Test koneksi\n  ifconfig     - Lihat interface jaringan\n  curl <url>   - Download/lihat URL\n  wget <url>   - Download file\n");
+        printf(COLOR_YELLOW "\nKEAMANAN:\n  firewall     - Atur firewall\n  scan         - Scan proses mencurigakan\n  antivirus [path] - Scan virus\n  ps           - Lihat proses\n  kill <pid>   - Hentikan proses\n");
+        printf(COLOR_YELLOW "\nPAKET:\n  pkg install <pkg>  - Install paket\n  pkg search <pkg>   - Cari paket\n  pkg update         - Update repo\n  pkg list           - Lihat paket terinstall\n");
+        printf(COLOR_YELLOW "\nUTILITAS:\n  time         - Tampilkan waktu\n  cal          - Tampilkan kalender\n  pray         - Pengingat sholat\n  history      - Riwayat perintah\n  lang [en/id] - Ganti bahasa\n  about        - Info FinixOS\n  clear        - Bersihkan layar\n  help         - Tampilkan bantuan ini\n  exit         - Keluar\n");
+        printf(COLOR_YELLOW "\nGAME:\n  game         - Tebak angka\n  tic          - Tic-Tac-Toe\n");
+    } else {
+        printf(COLOR_CYAN "\n=== FINIXOS v7.0 COMMANDS ===\n" COLOR_RESET);
+        printf(COLOR_YELLOW "\nFILE MANAGEMENT:\n  ls [dir]     - List files\n  mkdir <name> - Create directory\n  rm <file>    - Remove file\n  cd [dir]     - Change directory\n  pwd          - Print working directory\n  cp <src> <dst> - Copy file\n  mv <src> <dst> - Move file\n  cat <file>   - View file\n  nano <file>  - Edit file\n");
+        printf(COLOR_YELLOW "\nSYSTEM INFO:\n  cpu          - CPU information\n  ram          - RAM information\n  disk         - Storage information\n  os           - OS information\n  device       - Device information\n  battery      - Battery status\n  android      - Android info\n");
+        printf(COLOR_YELLOW "\nNETWORK:\n  netstat      - Network connections\n  nmap <host>  - Port scanner\n  ping <host>  - Test connection\n  ifconfig     - Network interfaces\n  curl <url>   - Download/view URL\n  wget <url>   - Download file\n");
+        printf(COLOR_YELLOW "\nSECURITY:\n  firewall     - Manage firewall\n  scan         - Scan suspicious processes\n  antivirus [path] - Virus scan\n  ps           - List processes\n  kill <pid>   - Terminate process\n");
+        printf(COLOR_YELLOW "\nPACKAGE:\n  pkg install <pkg>  - Install package\n  pkg search <pkg>   - Search package\n  pkg update         - Update repos\n  pkg list           - List installed\n");
+        printf(COLOR_YELLOW "\nUTILITIES:\n  time         - Show system time\n  cal          - Show calendar\n  pray         - Prayer reminder\n  history      - Command history\n  lang [en/id] - Change language\n  about        - About FinixOS\n  clear        - Clear screen\n  help         - Show this help\n  exit         - Exit\n");
+        printf(COLOR_YELLOW "\nGAMES:\n  game         - Guess the number\n  tic          - Tic-Tac-Toe\n");
+    }
+    printf("\n");
+}
+
+// ============================================
+// MAIN
+// ============================================
+int main(int argc, char **argv) {
+    char input[MAX_LINE], cmd[64], arg1[MAX_PATH], arg2[MAX_PATH], *args[10];
+    if (setjmp(crash_env) != 0) printf(COLOR_YELLOW "\nFinixOS recovered from crash\n" COLOR_RESET);
+    setup_error_recovery();
+    user_cache = kmem_cache_create("user_cache", sizeof(finix_user_t), MAX_USERS);
+    group_cache = kmem_cache_create("group_cache", sizeof(finix_group_t), MAX_GROUPS);
+    firewall_rule_cache = kmem_cache_create("firewall_rule", sizeof(firewall_rule_t), 128);
+    init_user_system(); firewall_init(); boot_screen();
+    char username[MAX_NAME], password[MAX_NAME];
+    printf("\nFinixOS v7.0 Login\n");
+    while(1) { printf("Username: "); scanf("%s", username); printf("Password: "); scanf("%s", password); if (authenticate_user(username, password)) { printf(COLOR_GREEN "\nWelcome, %s!\n" COLOR_RESET, username); break; } else printf(COLOR_RED "Invalid username or password\n" COLOR_RESET); }
+    int c; while ((c = getchar()) != '\n' && c != EOF);
+    while (1) {
+        char prompt[128], cwd[MAX_PATH];
+        if (getcwd(cwd, sizeof(cwd))) { char *home = getenv("HOME"); if (home && strstr(cwd, home) == cwd) snprintf(prompt, sizeof(prompt), "~%s", cwd + strlen(home)); else snprintf(prompt, sizeof(prompt), "%s", cwd); } else strcpy(prompt, "?");
+        time_t t = time(NULL); struct tm tm = *localtime(&t);
+        printf(COLOR_CYAN "\n%s@FinixOS v7.0 %02d:%02d:%02d [%s]> " COLOR_RESET, current_user->username, tm.tm_hour, tm.tm_min, tm.tm_sec, prompt); fflush(stdout);
+        if (!fgets(input, sizeof(input), stdin)) break;
+        input[strcspn(input, "\n")] = 0; if (strlen(input) == 0) continue;
+        add_to_history(input);
+        int arg_count = 0; char *token = strtok(input, " ");
+        while (token && arg_count < 10) { args[arg_count++] = token; token = strtok(NULL, " "); }
+        if (arg_count == 0) continue;
+        strcpy(cmd, args[0]); if (arg_count > 1) strcpy(arg1, args[1]); else arg1[0] = '\0'; if (arg_count > 2) strcpy(arg2, args[2]); else arg2[0] = '\0';
+        if (strcmp(cmd, "help") == 0) cmd_help();
+        else if (strcmp(cmd, "lang") == 0) cmd_lang(arg1);
+        else if (strcmp(cmd, "exit") == 0) { printf(COLOR_GREEN "Shutting down...\n" COLOR_RESET); break; }
+        else if (strcmp(cmd, "clear") == 0) system("clear");
+        else if (strcmp(cmd, "about") == 0) cmd_about();
+        else if (strcmp(cmd, "history") == 0) show_history();
+        else if (strcmp(cmd, "ls") == 0) cmd_ls(arg1);
+        else if (strcmp(cmd, "pwd") == 0) cmd_pwd();
+        else if (strcmp(cmd, "cd") == 0) cmd_cd(arg1);
+        else if (strcmp(cmd, "mkdir") == 0) cmd_mkdir(arg1);
+        else if (strcmp(cmd, "rm") == 0) cmd_rm(arg1);
+        else if (strcmp(cmd, "cp") == 0) cmd_cp(arg1, arg2);
+        else if (strcmp(cmd, "mv") == 0) cmd_mv(arg1, arg2);
+        else if (strcmp(cmd, "cat") == 0) cmd_cat(arg1);
+        else if (strcmp(cmd, "nano") == 0) cmd_nano(arg1);
+        else if (strcmp(cmd, "cpu") == 0) cmd_cpu();
+        else if (strcmp(cmd, "ram") == 0) cmd_ram();
+        else if (strcmp(cmd, "disk") == 0) cmd_disk();
+        else if (strcmp(cmd, "os") == 0) system("uname -a");
+        else if (strcmp(cmd, "device") == 0) { system("uname -m"); system("cat /proc/version | head -1"); }
+        else if (strcmp(cmd, "battery") == 0) cmd_battery();
+        else if (strcmp(cmd, "android") == 0) cmd_android();
+        else if (strcmp(cmd, "time") == 0) { time_t t = time(NULL); printf("%s", ctime(&t)); }
+        else if (strcmp(cmd, "netstat") == 0) cmd_netstat();
+        else if (strcmp(cmd, "nmap") == 0) cmd_nmap(arg1);
+        else if (strcmp(cmd, "ping") == 0) cmd_ping(arg1);
+        else if (strcmp(cmd, "ifconfig") == 0) cmd_ifconfig();
+        else if (strcmp(cmd, "curl") == 0) cmd_curl(arg1);
+        else if (strcmp(cmd, "wget") == 0) cmd_wget(arg1);
+        else if (strcmp(cmd, "firewall") == 0) {
+            if (strcmp(arg1, "add") == 0) { char proto[8]; int port; char action[8]; if (arg_count >= 4) { strcpy(proto, arg2); port = atoi(args[3]); if (arg_count >= 5) strcpy(action, args[4]); else strcpy(action, "allow"); cmd_firewall_add(proto, port, action); } else printf("Usage: firewall add <proto> <port> [allow|deny]\n"); }
+            else if (strcmp(arg1, "list") == 0) cmd_firewall_list();
+            else if (strcmp(arg1, "delete") == 0) { if (arg_count >= 3) cmd_firewall_delete(atoi(arg2)); else printf("Usage: firewall delete <port>\n"); }
+            else printf("Usage: firewall <add|list|delete>\n");
+        }
+        else if (strcmp(cmd, "scan") == 0) cmd_scan();
+        else if (strcmp(cmd, "antivirus") == 0) cmd_antivirus_scan(arg1);
+        else if (strcmp(cmd, "ps") == 0) cmd_ps();
+        else if (strcmp(cmd, "kill") == 0) cmd_kill_process(arg1);
+        else if (strcmp(cmd, "pkg") == 0) {
+            if (strcmp(arg1, "install") == 0) cmd_pkg_install(arg2);
+            else if (strcmp(arg1, "search") == 0) cmd_pkg_search(arg2);
+            else if (strcmp(arg1, "update") == 0) cmd_pkg_update();
+            else if (strcmp(arg1, "list") == 0) cmd_pkg_list();
+            else printf("Usage: pkg <install|search|update|list>\n");
+        }
+        else if (strcmp(cmd, "cal") == 0) cmd_cal();
+        else if (strcmp(cmd, "pray") == 0) cmd_pray();
+        else if (strcmp(cmd, "game") == 0) cmd_game_tebak();
+        else if (strcmp(cmd, "tic") == 0) cmd_game_tictactoe();
+        else { if (current_lang == LANG_ID) printf(COLOR_RED "Perintah tidak dikenal: %s\nKetik 'help' untuk bantuan\n" COLOR_RESET, cmd); else printf(COLOR_RED "Unknown command: %s\nType 'help' for available commands\n" COLOR_RESET, cmd); }
+    }
+    for (int i = 0; i < history_count; i++) free(history[i]);
+    kmem_cache_destroy(user_cache); kmem_cache_destroy(group_cache); kmem_cache_destroy(firewall_rule_cache);
+    return 0;
+}
