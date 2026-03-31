@@ -1,0 +1,23 @@
+# FinixOS v7.0
+
+Mini Operating System built from scratch in C.
+
+## Features
+- Multi-user system with permissions
+- Memory management (refcount, slab cache)
+- Firewall with rule management
+- Network tools (nmap, netstat)
+- Package manager (APT wrapper)
+- Basic antivirus scanner
+- System monitor (CPU, RAM, battery)
+- Multi-language (English/Indonesia)
+- Crash recovery system
+- Games: Tebak Angka, Tic-Tac-Toe
+- Prayer reminder
+
+## How to Compile
+```bash
+gcc -o finixos finixos.c -lm
+./finixos
+username = root
+pasword = finix123
